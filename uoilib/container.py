@@ -47,6 +47,10 @@ class Container:
         self.container = lxc.Container(name)
         self.run_as = run_as
 
+    @property
+    def abspath(self):
+        return os.path.join('/var/lib/lxc', self.name)
+
     def ip(self):
         try:
             ips = self.container.get_ips()

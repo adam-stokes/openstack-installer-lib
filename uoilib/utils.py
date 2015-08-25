@@ -16,8 +16,8 @@
 from subprocess import (Popen, PIPE, call, check_output, STDOUT,
                         check_call, DEVNULL, CalledProcessError)
 
-from importlib import import_module
 from jinja2 import Environment, FileSystemLoader
+from tornado.util import import_object
 import configparser
 import errno
 import itertools
@@ -34,7 +34,7 @@ import sys
 import time
 import yaml
 
-log = logging.getLogger('cloudinstall.utils')
+log = logging.getLogger('uoilib.utils')
 
 
 class UtilsException(Exception):
@@ -77,7 +77,7 @@ def load_ext_charms(plug_path, charm_modules):
         raise Exception("Problem importing external charms: {}".format(e))
 
     for (_, mname, _) in pkgutil.iter_modules(charms.__path__):
-        charm = import_module('charms.' + mname)
+        charm = import_object('charms.' + mname)
 
         # Override any system charms
         idx = [idx for idx, i in
@@ -86,7 +86,7 @@ def load_ext_charms(plug_path, charm_modules):
         if idx:
             charm_modules[idx[0]] = charm
         else:
-            charm_modules.extend([import_module('charms.' + mname)])
+            charm_modules.extend([import_object('charms.' + mname)])
     log.debug("Found additional charms: {}".format(charm_modules))
 
     return charm_modules
@@ -97,7 +97,7 @@ def load_charms(ext_charm_path=None):
     """
     import cloudinstall.charms
 
-    charm_modules = [import_module('cloudinstall.charms.' + mname)
+    charm_modules = [import_object('cloudinstall.charms.' + mname)
                      for (_, mname, _) in
                      pkgutil.iter_modules(cloudinstall.charms.__path__)]
 
@@ -122,7 +122,7 @@ def load_charm_byname(name):
 
     :param str name: name of charm
     """
-    return import_module('cloudinstall.charms.{}'.format(name))
+    return import_object('cloudinstall.charms.{}'.format(name))
 
 
 def render_charm_config(dst, **kwargs):
@@ -724,7 +724,7 @@ class Juju:
     """ various juju utilities """
 
     @classmethod
-    def set_juju(cls, dst, owner, **kwargs):
+    def write_environments(cls, env_type, dst, owner, **kwargs):
         """ set juju environments for bootstrap
         """
         if 'password' not in kwargs:
@@ -741,10 +741,18 @@ class Juju:
             if val:
                 render_parts[opt] = val
 
+        if env_type == "multi":
+            maas_creds = kwargs.get('maascreds', None)
+            if not maas_creds:
+                raise Exception("Unable to read MAAS Credentials.")
+
+            render_parts['maas_server'] = maas_creds['api_host']
+            render_parts['maas_apikey'] = maas_creds['api_key']
+
         # configure juju environment for bootstrap
-        single_env = load_template('juju-env/single.yaml')
-        single_env_modified = single_env.render(render_parts)
-        spew(dst, single_env_modified, owner=owner)
+        env = load_template('juju-env/{}.yaml'.format(env_type))
+        env_modified = env.render(render_parts)
+        spew(dst, env_modified, owner=owner)
 
 
 class CloudInit:

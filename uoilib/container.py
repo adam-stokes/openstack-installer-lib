@@ -20,6 +20,8 @@ import logging
 import shlex
 import os
 import lxc
+from . import utils, netutils
+from ipaddress import IPv4Network
 
 log = logging.getLogger("uoilib.container")
 
@@ -41,6 +43,7 @@ class Container:
     :params str run_as: User to run additional commands with
     """
     def __init__(self, name, run_as):
+        self.name = name
         self.container = lxc.Container(name)
         self.run_as = run_as
 
@@ -116,3 +119,40 @@ class Container:
         if self.container.state == "RUNNING":
             self.container.stop()
         self.container.destroy()
+
+    def set_static_route(self, lxc_net):
+        """ Adds static route to host system
+        """
+        # Store container IP in config
+        log.info("Adding static route for {} via {}".format(lxc_net,
+                                                            self.ip()))
+        out = utils.get_command_output(
+            'ip route add {} via {} dev lxcbr0'.format(lxc_net, self.ip()))
+        if out['status'] != 0:
+            raise Exception("Could not add static route for {}"
+                            " network: {}".format(lxc_net, out['output']))
+        return self.ip()
+
+    def write_lxc_net_config(self):
+        """Finds and configures a new subnet for the host container,
+        to avoid overlapping with IPs used for Neutron.
+        """
+        lxc_net_template = utils.load_template('lxc-net')
+        container_path = os.path.join('/var/lib/lxc', self.name)
+        lxc_net_container_filename = os.path.join(container_path,
+                                                  'rootfs/etc/default/lxc-net')
+
+        network = netutils.get_unique_lxc_network()
+        nw = IPv4Network(network)
+        addr = nw[1]
+        netmask = nw.with_netmask.split('/')[-1]
+        net_low, net_high = netutils.ip_range_max(nw, [addr])
+        dhcp_range = "{},{}".format(net_low, net_high)
+        render_parts = dict(addr=addr,
+                            netmask=netmask,
+                            network=network,
+                            dhcp_range=dhcp_range)
+        lxc_net = lxc_net_template.render(render_parts)
+        log.info("Writing lxc-net config for {}".format(self.name))
+        utils.spew(lxc_net_container_filename, lxc_net)
+        return network

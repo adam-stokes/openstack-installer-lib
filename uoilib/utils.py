@@ -13,31 +13,26 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from subprocess import (Popen, PIPE, call,
+from subprocess import (Popen, PIPE, call, check_output, STDOUT,
                         check_call, DEVNULL, CalledProcessError)
-try:
-    from collections import Mapping
-except ImportError:
-    Mapping = dict
 
-from jinja2 import Environment, FileSystemLoader
-import os
-import re
-import string
-import random
-import logging
-import itertools
-import configparser
-import time
 from importlib import import_module
-import pkgutil
-import sys
+from jinja2 import Environment, FileSystemLoader
+import configparser
 import errno
-import shutil
+import itertools
 import json
-import yaml
+import logging
+import os
+import pkgutil
+import random
+import re
 import requests
-from cloudinstall.async import Async
+import shutil
+import string
+import sys
+import time
+import yaml
 
 log = logging.getLogger('cloudinstall.utils')
 
@@ -47,7 +42,7 @@ class UtilsException(Exception):
 
 
 def cleanup():
-    pid = os.path.join(install_home(), '.cloud-install/openstack.pid')
+    pid = os.path.join('/var/run/openstack.pid')
     if os.path.isfile(pid):
         os.remove(pid)
     log.debug('Attempting to reset the terminal')
@@ -484,10 +479,6 @@ def ssh_read_privkey():
         return f.read()
 
 
-def ssh_genkey_async():
-    return Async.pool.submit(ssh_genkey)
-
-
 def ssh_genkey():
     """ Generates sshkey
     """
@@ -681,3 +672,183 @@ def juju_env(config):
 
     raise UtilsException('Unable to load environments file. Is '
                          'juju bootstrapped?')
+
+
+def ensure_nested_kvm(name):
+    """kvm_intel module defaults to nested OFF. If qemu_system_x86 is not
+    installed, this may stay off. Our package installs a
+    modprobe.d/openstack.conf file to fix this after reboots, but
+    we also try to reload the module to work now.
+    """
+
+    if 0 == call("lsmod | grep kvm_amd", shell=True):
+        return              # we're fine, kvm_amd has nested on by default
+    if 0 != call("lsmod | grep kvm_intel", shell=True):
+        raise Exception("kvm_intel kernel module not loaded, "
+                        "nested VMs will fail to launch")
+
+    try:
+        nested_on = check_output("cat "
+                                 "/sys/module/kvm_intel/parameters/nested"
+                                 "".format(name),
+                                 shell=True, stderr=STDOUT).decode('utf-8')
+        if nested_on.strip() == 'Y':
+            return
+    except:
+        log.exception("can't cat /sys/module/kvm_intel/parameters/nested")
+        raise Exception("error inspecting kvm_intel module params, nested"
+                        "VMs likely will not work")
+
+    # need to unload and reload module
+    try:
+        check_call("modprobe -r kvm_intel", shell=True)
+    except Exception as e:
+        log.exception("couldn't unload kvm_intel: {}".format(e.output))
+        raise Exception("Could not automatically unload kvm_intel module "
+                        "to enable nested VMs. A manual reboot or reload"
+                        "will be required.")
+
+    if 0 != call("modprobe kvm_intel", shell=True):
+        raise Exception("Could not automatically reload kvm_intel kernel"
+                        "module to enable nested VMs. A manual reboot or "
+                        "reload will be required.")
+    return True
+
+
+def copy_upstream_deb(src, dst):
+    """ Copies local upstream debian package into container """
+    shutil.copy(src, dst)
+
+
+class Juju:
+    """ various juju utilities """
+
+    @classmethod
+    def set_juju(cls, dst, owner, **kwargs):
+        """ set juju environments for bootstrap
+        """
+        if 'password' not in kwargs:
+            raise Exception("Required password not provided.")
+
+        render_parts = {
+            'openstack_password': kwargs['password'],
+            'ubuntu_series': kwargs.get('series', 'trusty')
+        }
+
+        for opt in ['apt_proxy', 'apt_https_proxy', 'http_proxy',
+                    'https_proxy']:
+            val = kwargs.get(opt, None)
+            if val:
+                render_parts[opt] = val
+
+        # configure juju environment for bootstrap
+        single_env = load_template('juju-env/single.yaml')
+        single_env_modified = single_env.render(render_parts)
+        spew(dst, single_env_modified, owner=owner)
+
+
+class CloudInit:
+    """ Cloud-init specific utilities """
+
+    @classmethod
+    def set_userdata(cls, dst, **kwargs):
+        """ set userdata file for container install
+
+        :param str dst: Destination path to save userdata.yaml
+        """
+        render_parts = {'extra_sshkeys': [ssh_read_pubkey()]}
+
+        upstream_ppa = kwargs.get('upstream_ppa', None)
+        if upstream_ppa:
+            render_parts['upstream_ppa'] = upstream_ppa
+
+        render_parts['seed_command'] = CloudInit.proxy_pollinate()
+
+        for opt in ['apt_proxy', 'apt_https_proxy', 'http_proxy'
+                    'https_proxy', 'no_proxy', 'image_metadata_url',
+                    'tools_metadata_url', 'apt_mirror']:
+            val = kwargs.get(opt, None)
+            if val:
+                render_parts[opt] = val
+
+        original_data = load_template('userdata.yaml')
+        log.info("Prepared userdata: {}".format(render_parts))
+        modified_data = original_data.render(render_parts)
+        spew(dst, modified_data)
+
+    @classmethod
+    def proxy_pollinate(cls, **kwargs):
+        """ Return pollinate cmd including http/s proxy if set """
+        # pass proxy through to pollinate
+        http_proxy = kwargs.get('http_proxy')
+        https_proxy = kwargs.get('https_proxy')
+        log.debug('Found proxy info: {}/{}'.format(http_proxy, https_proxy))
+        pollinate = ['env']
+        if http_proxy:
+            pollinate.append('http_proxy={}'.format(http_proxy))
+        if https_proxy:
+            pollinate.append('https_proxy={}'.format(https_proxy))
+        pollinate.extend(['pollinate', '-q'])
+        return pollinate
+
+    @classmethod
+    def finished(cls, container, tries, maxlenient=20):
+        """checks cloud-init result.json in container to find out status
+
+        For the first `maxlenient` tries, it treats a container with
+        no IP and SSH errors as non-fatal, assuming initialization is
+        still ongoing. Afterwards, will raise exceptions for those
+        errors, so as not to loop forever.
+
+        returns True if cloud-init finished with no errors, False if
+        it's not done yet, and raises an exception if it had errors.
+
+        """
+        cmd = 'sudo cat /run/cloud-init/result.json'
+        try:
+            result_json = container.run(cmd)
+
+        except container.NoContainerIPException as e:
+            log.debug("Container has no IPs according to lxc-info. "
+                      "Will retry.")
+            return False
+
+        except container.ContainerRunException as e:
+            _, returncode = e.args
+            if returncode == 255:
+                if tries < maxlenient:
+                    log.debug("Ignoring initial SSH error.")
+                    return False
+                raise e
+            if returncode == 1:
+                # the 'cat' did not find the file.
+                if tries < 1:
+                    log.debug("Waiting for cloud-init status result")
+                return False
+            else:
+                log.debug("Unexpected return code from reading "
+                          "cloud-init status in container.")
+                raise e
+
+        if result_json == '':
+            return False
+
+        try:
+            ret = json.loads(result_json)
+        except Exception as e:
+            if tries < maxlenient + 10:
+                log.debug("exception trying to parse '{}'"
+                          " - retrying".format(result_json))
+                return False
+
+            log.error(str(e))
+            log.debug("exception trying to parse '{}'".format(result_json))
+            raise e
+
+        errors = ret['v1']['errors']
+        if len(errors):
+            log.error("Container cloud-init finished with "
+                      "errors: {}".format(errors))
+            raise Exception("Top-level container OS did not initialize "
+                            "correctly.")
+        return True
